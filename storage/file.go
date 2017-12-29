@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/anacrolix/missinggo"
 
@@ -72,6 +73,7 @@ func (fs *fileClientImpl) OpenTorrent(info *metainfo.Info, infoHash metainfo.Has
 		info,
 		infoHash,
 		fs.pc,
+		map[string]*fileTorrentHandle{},
 	}, nil
 }
 
@@ -80,6 +82,7 @@ type fileTorrentImpl struct {
 	info       *metainfo.Info
 	infoHash   metainfo.Hash
 	completion PieceCompletion
+	handles    map[string]*fileTorrentHandle
 }
 
 func (fts *fileTorrentImpl) Piece(p metainfo.Piece) PieceImpl {
@@ -94,21 +97,51 @@ func (fts *fileTorrentImpl) Piece(p metainfo.Piece) PieceImpl {
 	}
 }
 
+func (fs *fileTorrentImpl) OpenFile(fi metainfo.FileInfo, creatable bool) (*fileTorrentHandle, error) {
+	filename := fs.fileInfoName(fi)
+	if h, ok := fs.handles[filename]; ok {
+		return h, nil
+	}
+
+	if _, err := os.Stat(filename); os.IsNotExist(err) && !creatable {
+		return nil, io.EOF
+	}
+
+	os.MkdirAll(filepath.Dir(filename), 0770)
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0660)
+	if err != nil {
+		return nil, err
+	}
+
+	fs.handles[filename] = &fileTorrentHandle{f, filename, &sync.Mutex{}}
+	return fs.handles[filename], nil
+}
+
 func (fs *fileTorrentImpl) Close() error {
+	for _, h := range fs.handles {
+		if h != nil && h.f != nil {
+			err := h.f.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
-// Creates natives files for any zero-length file entries in the info. This is
-// a helper for file-based storages, which don't address or write to zero-
-// length files because they have no corresponding pieces.
+// CreateNativeZeroLengthFiles Creates natives files for any zero-length file
+// entries in the info. This is a helper for file-based storages, which
+// don't address or write to zero-length files because they have
+// no corresponding pieces.
 func CreateNativeZeroLengthFiles(info *metainfo.Info, dir string) (err error) {
 	for _, fi := range info.UpvertedFiles() {
 		if fi.Length != 0 {
 			continue
 		}
 		name := filepath.Join(append([]string{dir, info.Name}, fi.Path...)...)
-		os.MkdirAll(filepath.Dir(name), 0750)
-		var f io.Closer
+		os.MkdirAll(filepath.Dir(name), 0770)
+		var f *os.File
 		f, err = os.Create(name)
 		if err != nil {
 			break
@@ -125,22 +158,21 @@ type fileTorrentImplIO struct {
 
 // Returns EOF on short or missing file.
 func (fst *fileTorrentImplIO) readFileAt(fi metainfo.FileInfo, b []byte, off int64) (n int, err error) {
-	f, err := os.Open(fst.fts.fileInfoName(fi))
-	if os.IsNotExist(err) {
-		// File missing is treated the same as a short file.
-		err = io.EOF
-		return
-	}
+	var h *fileTorrentHandle
+	h, err = fst.fts.OpenFile(fi, false)
 	if err != nil {
 		return
 	}
-	defer f.Close()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	// Limit the read to within the expected bounds of this file.
 	if int64(len(b)) > fi.Length-off {
 		b = b[:fi.Length-off]
 	}
 	for off < fi.Length && len(b) != 0 {
-		n1, err1 := f.ReadAt(b, off)
+		n1, err1 := h.f.ReadAt(b, off)
 		b = b[n1:]
 		n += n1
 		off += int64(n1)
@@ -191,16 +223,15 @@ func (fst fileTorrentImplIO) WriteAt(p []byte, off int64) (n int, err error) {
 		if int64(n1) > fi.Length-off {
 			n1 = int(fi.Length - off)
 		}
-		name := fst.fts.fileInfoName(fi)
-		os.MkdirAll(filepath.Dir(name), 0770)
-		var f *os.File
-		f, err = os.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0660)
+		var h *fileTorrentHandle
+		h, err = fst.fts.OpenFile(fi, true)
 		if err != nil {
 			return
 		}
-		n1, err = f.WriteAt(p[:n1], off)
+		h.mu.Lock()
+		n1, err = h.f.WriteAt(p[:n1], off)
 		// TODO: On some systems, write errors can be delayed until the Close.
-		f.Close()
+		h.mu.Unlock()
 		if err != nil {
 			return
 		}
@@ -216,4 +247,10 @@ func (fst fileTorrentImplIO) WriteAt(p []byte, off int64) (n int, err error) {
 
 func (fts *fileTorrentImpl) fileInfoName(fi metainfo.FileInfo) string {
 	return filepath.Join(append([]string{fts.dir, fts.info.Name}, fi.Path...)...)
+}
+
+type fileTorrentHandle struct {
+	f    *os.File
+	path string
+	mu   *sync.Mutex
 }

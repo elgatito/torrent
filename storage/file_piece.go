@@ -2,7 +2,6 @@ package storage
 
 import (
 	"io"
-	"os"
 
 	"github.com/anacrolix/torrent/metainfo"
 )
@@ -17,7 +16,10 @@ type filePieceImpl struct {
 var _ PieceImpl = (*filePieceImpl)(nil)
 
 func (me *filePieceImpl) pieceKey() metainfo.PieceKey {
-	return metainfo.PieceKey{me.infoHash, me.p.Index()}
+	return metainfo.PieceKey{
+		InfoHash: me.infoHash,
+		Index:    me.p.Index(),
+	}
 }
 
 func (fs *filePieceImpl) Completion() Completion {
@@ -28,8 +30,17 @@ func (fs *filePieceImpl) Completion() Completion {
 	// If it's allegedly complete, check that its constituent files have the
 	// necessary length.
 	for _, fi := range extentCompleteRequiredLengths(fs.p.Info, fs.p.Offset(), fs.p.Length()) {
-		s, err := os.Stat(fs.fileInfoName(fi))
-		if err != nil || s.Size() < fi.Length {
+		h, errOpen := fs.fileTorrentImpl.OpenFile(fi, false)
+		if errOpen != nil {
+			c.Complete = false
+			break
+		}
+
+		h.mu.Lock()
+		s, err := h.f.Stat()
+		h.mu.Unlock()
+
+		if err != nil || s == nil || s.Size() < fi.Length {
 			c.Complete = false
 			break
 		}
