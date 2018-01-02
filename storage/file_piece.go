@@ -2,6 +2,7 @@ package storage
 
 import (
 	"io"
+	"os"
 
 	"github.com/anacrolix/torrent/metainfo"
 )
@@ -30,21 +31,13 @@ func (fs *filePieceImpl) Completion() Completion {
 	// If it's allegedly complete, check that its constituent files have the
 	// necessary length.
 	for _, fi := range extentCompleteRequiredLengths(fs.p.Info, fs.p.Offset(), fs.p.Length()) {
-		h, errOpen := fs.fileTorrentImpl.OpenFile(fi, false)
-		if errOpen != nil {
-			c.Complete = false
-			break
-		}
-
-		h.mu.Lock()
-		s, err := h.f.Stat()
-		h.mu.Unlock()
-
-		if err != nil || s == nil || s.Size() < fi.Length {
+		s, err := os.Stat(fs.fileInfoName(fi))
+		if err != nil || s.Size() < fi.Length {
 			c.Complete = false
 			break
 		}
 	}
+
 	if !c.Complete {
 		// The completion was wrong, fix it.
 		fs.completion.Set(fs.pieceKey(), false)
